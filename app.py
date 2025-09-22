@@ -7,110 +7,153 @@ from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 
 # -------------------------
-# Small helpers
+# Download & load helpers
 # -------------------------
-def load_model(uploaded_file) -> Any:
-    """Load a scikit-learn / XGBoost / LightGBM model saved via joblib or pickle."""
-    data = uploaded_file.read()
-    # Try joblib first (common for sklearn)
+@st.cache_data(show_spinner=False)
+def fetch_bytes(url: str) -> bytes:
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.content
+
+def load_model_from_bytes(data: bytes) -> Any:
+    # Try joblib first (typical for sklearn/xgb/LGBM dumps)
     try:
         import joblib
         return joblib.load(io.BytesIO(data))
     except Exception:
         pass
-    # Fallback to pickle
+    # Fallback: pickle
     return pickle.loads(data)
+
+def load_model_from_url(url: str) -> Any:
+    data = fetch_bytes(url)
+    return load_model_from_bytes(data)
+
+def load_threshold_from_url(url: str) -> Optional[float]:
+    try:
+        raw = fetch_bytes(url).decode("utf-8")
+        js = json.loads(raw)
+        # allow {"threshold": 0.6} or {"positive_class_threshold": 0.6} or {"thresholds":{"1":0.6}}
+        if isinstance(js, dict):
+            if "threshold" in js and isinstance(js["threshold"], (int, float)):
+                return float(js["threshold"])
+            if "positive_class_threshold" in js and isinstance(js["positive_class_threshold"], (int, float)):
+                return float(js["positive_class_threshold"])
+            if "thresholds" in js and isinstance(js["thresholds"], dict):
+                if "1" in js["thresholds"] and isinstance(js["thresholds"]["1"], (int, float)):
+                    return float(js["thresholds"]["1"])
+                # first numeric value
+                for v in js["thresholds"].values():
+                    if isinstance(v, (int, float)):
+                        return float(v)
+        return None
+    except Exception:
+        return None
 
 def read_dataframe(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
         return pd.read_csv(uploaded_file)
-    elif name.endswith(".parquet") or name.endswith(".pq"):
+    if name.endswith(".parquet") or name.endswith(".pq"):
         return pd.read_parquet(uploaded_file)
-    else:
-        # Last-resort CSV
-        return pd.read_csv(uploaded_file)
+    # last resort: try CSV
+    return pd.read_csv(uploaded_file)
 
 def predict_proba_safe(model, X: pd.DataFrame) -> Optional[np.ndarray]:
     """Return positive-class probabilities if possible, else None."""
+    # predict_proba
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(X)
-        # Binary: take column for positive class (try class 1 if present, else last col)
         if proba.ndim == 2:
+            # Prefer class label 1 if present; else last column
             if hasattr(model, "classes_") and 1 in getattr(model, "classes_", []):
                 pos_idx = list(model.classes_).index(1)
             else:
                 pos_idx = -1
             return proba[:, pos_idx]
+    # decision_function -> sigmoid
     if hasattr(model, "decision_function"):
         s = model.decision_function(X)
-        # Sigmoid map for binary scores
-        if s.ndim == 1:
-            return 1 / (1 + np.exp(-s))
+        if np.ndim(s) == 1:
+            return 1.0 / (1.0 + np.exp(-s))
     return None
 
 
 # -------------------------
 # UI
 # -------------------------
-st.set_page_config(page_title="Simple Batch Predictor", page_icon="🧪", layout="centered")
-st.title("🧪 Simple Batch Predictor")
-st.caption("Upload a trained model and a DataFrame with feature columns. Get predictions and probabilities (if available).")
+st.set_page_config(page_title="GitHub Model Batch Predictor", page_icon="🧪", layout="centered")
+st.title("🧪 Simple Batch Predictor (GitHub model)")
+st.caption("Paste RAW GitHub URLs for your model & threshold. Upload a DataFrame. Get probabilities and labels.")
 
 with st.sidebar:
-    st.header("1) Upload model")
-    model_file = st.file_uploader("Model file (.joblib / .pkl)", type=["joblib", "pkl"])
+    st.header("1) Model from GitHub")
+    gh_model_url = st.text_input(
+        "RAW URL to xgb_mid_model.joblib",
+        placeholder="https://raw.githubusercontent.com/<user>/<repo>/<branch>/path/xgb_mid_model.joblib",
+    )
+    st.header("2) Threshold (optional)")
+    gh_thr_url = st.text_input(
+        "RAW URL to xgb_mid_threshold.json",
+        placeholder="https://raw.githubusercontent.com/<user>/<repo>/<branch>/path/xgb_mid_threshold.json",
+    )
 
-    st.header("2) Upload data")
-    data_file = st.file_uploader("Data file (.csv / .parquet)", type=["csv", "parquet", "pq"])
+    st.header("3) Data")
+    data_file = st.file_uploader("Upload DataFrame (.csv / .parquet)", type=["csv", "parquet", "pq"])
 
     st.header("Options")
-    default_threshold = st.number_input("Decision threshold (binary)", 0.0, 1.0, 0.5, 0.01)
+    default_threshold = st.number_input("Decision threshold (fallback)", 0.0, 1.0, 0.5, 0.01)
     run = st.button("Predict")
 
-# State
-model = None
-df = None
-
 # Load model
-if model_file is not None:
+model = None
+thr = None
+
+if gh_model_url.strip():
     try:
-        model = load_model(model_file)
-        st.success(f"Loaded model: {model_file.name}")
+        model = load_model_from_url(gh_model_url.strip())
+        st.success("Model loaded from GitHub.")
     except Exception as e:
-        st.error(f"Could not load model: {e}")
+        st.error(f"Could not load model from GitHub: {e}")
+
+if gh_thr_url.strip():
+    val = load_threshold_from_url(gh_thr_url.strip())
+    if val is not None:
+        thr = float(val)
+        st.info(f"Threshold from JSON: {thr:.4f}")
+    else:
+        st.warning("Could not parse threshold JSON; using fallback.")
 
 # Load data
+df = None
 if data_file is not None:
     try:
         df = read_dataframe(data_file)
         st.success(f"Loaded data: {data_file.name}  •  {len(df):,} rows, {df.shape[1]} cols")
-        st.write("Data preview:")
+        st.write("Preview:")
         st.dataframe(df.head(15), use_container_width=True)
     except Exception as e:
         st.error(f"Could not read data: {e}")
 
 # Feature selection
+feat_cols, id_col = [], "(none)"
 if df is not None:
     st.subheader("Select feature columns")
+    # by default, everything except obvious labels
     default_feats = [c for c in df.columns if c.lower() not in {"class", "target", "label"}]
-    feat_cols = st.multiselect(
-        "Features used by the model",
-        options=list(df.columns),
-        default=default_feats if default_feats else list(df.columns),
-    )
+    feat_cols = st.multiselect("Features used by the model", options=list(df.columns),
+                               default=default_feats if default_feats else list(df.columns))
     id_col = st.selectbox("Optional ID column to keep", options=["(none)"] + list(df.columns), index=0)
-else:
-    feat_cols, id_col = [], "(none)"
 
-# Run prediction
+# Predict
 if run:
     if model is None:
-        st.warning("Upload a model first.")
+        st.warning("Provide a valid RAW GitHub URL for the model.")
     elif df is None:
         st.warning("Upload a data file first.")
     elif not feat_cols:
@@ -118,25 +161,23 @@ if run:
     else:
         X = df[feat_cols].copy()
 
-        # Try to align to model.feature_names_in_, if it exists
+        # Auto-align to model.feature_names_in_ if present
         if hasattr(model, "feature_names_in_"):
             needed = list(model.feature_names_in_)
             missing = [c for c in needed if c not in X.columns]
             extra = [c for c in X.columns if c not in needed]
-            # Add missing as 0.0
             for m in missing:
                 X[m] = 0.0
-            # Reorder to match model
             X = X[needed]
             if missing:
                 st.info(f"Added {len(missing)} missing feature(s) as 0: {missing[:8]}{' ...' if len(missing)>8 else ''}")
             if extra:
                 st.info(f"Ignored {len(extra)} extra column(s) not used by the model: {extra[:8]}{' ...' if len(extra)>8 else ''}")
 
-        # Predictions
+        # Probabilities if possible
         y_prob = predict_proba_safe(model, X)
-        # If probability not available, fall back to label prediction
         if y_prob is None:
+            # Fall back to labels only
             if hasattr(model, "predict"):
                 y_pred = model.predict(X)
                 out = pd.DataFrame(index=df.index)
@@ -148,14 +189,16 @@ if run:
                 st.download_button(
                     "💾 Download results (CSV)",
                     out.to_csv(index=False).encode("utf-8"),
-                    file_name=f"predictions_{Path(model_file.name).stem}.csv",
+                    file_name=f"predictions_{Path('github_model').stem}.csv",
                     mime="text/csv",
                 )
             else:
                 st.error("Model has neither predict_proba/decision_function nor predict.")
         else:
-            # Binary probabilities available
-            y_pred = (y_prob >= default_threshold).astype(int)
+            # Use JSON threshold if provided; else fallback from sidebar
+            use_thr = float(thr) if thr is not None else float(default_threshold)
+            y_pred = (y_prob >= use_thr).astype(int)
+
             out = pd.DataFrame(index=df.index)
             if id_col != "(none)" and id_col in df.columns:
                 out[id_col] = df[id_col]
@@ -165,7 +208,6 @@ if run:
             st.subheader("Results")
             st.dataframe(out.head(30), use_container_width=True)
 
-            # Quick distribution
             st.caption("Probability distribution (binned):")
             hist = pd.Series(y_prob).value_counts(bins=20, sort=False)
             st.bar_chart(hist)
@@ -173,8 +215,8 @@ if run:
             st.download_button(
                 "💾 Download results (CSV)",
                 out.to_csv(index=False).encode("utf-8"),
-                file_name=f"predictions_{Path(model_file.name).stem}.csv",
+                file_name=f"predictions_{Path('github_model').stem}.csv",
                 mime="text/csv",
             )
 
-st.caption("Tip: If your model exposes `feature_names_in_`, features will be auto-aligned and missing ones filled with 0.")
+st.caption("Tip: Use the **RAW** GitHub file URL (button on GitHub file view).")
