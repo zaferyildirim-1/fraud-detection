@@ -1,330 +1,180 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "b80b4b11-bbd9-4bc6-9381-c7894477a32a",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# app.py\n",
-    "import io\n",
-    "import json\n",
-    "import pickle\n",
-    "from pathlib import Path\n",
-    "from typing import Any, Dict, Optional, Tuple, List\n",
-    "\n",
-    "import numpy as np\n",
-    "import pandas as pd\n",
-    "import streamlit as st\n",
-    "\n",
-    "# ---------------------------\n",
-    "# Helpers: load & thresholds\n",
-    "# ---------------------------\n",
-    "\n",
-    "def _load_model(file) -> Any:\n",
-    "    \"\"\"Load a model from a file-like object supporting joblib/pickle.\"\"\"\n",
-    "    name = file.name.lower()\n",
-    "    data = file.read()\n",
-    "    # Try joblib first, then pickle\n",
-    "    try:\n",
-    "        import joblib  # local import to avoid hard dependency during parse\n",
-    "        return joblib.load(io.BytesIO(data))\n",
-    "    except Exception:\n",
-    "        pass\n",
-    "    # Fallback: pickle\n",
-    "    return pickle.loads(data)\n",
-    "\n",
-    "def _load_json_threshold(file) -> Dict[str, Any]:\n",
-    "    raw = file.read().decode(\"utf-8\")\n",
-    "    return json.loads(raw)\n",
-    "\n",
-    "def _extract_threshold(thr_json: Dict[str, Any], model_key: Optional[str] = None, default: float = 0.5) -> float:\n",
-    "    \"\"\"\n",
-    "    Accepts common shapes:\n",
-    "      - {\"threshold\": 0.6085}\n",
-    "      - {\"model_name\": {\"threshold\": 0.6085}}\n",
-    "      - {\"positive_class_threshold\": 0.6085}\n",
-    "      - {\"thresholds\": {\"1\": 0.6085}}   # class-indexed\n",
-    "    If model_key is provided, will try nested lookup first.\n",
-    "    \"\"\"\n",
-    "    if thr_json is None:\n",
-    "        return default\n",
-    "    # If model_key given, check nested\n",
-    "    if model_key and isinstance(thr_json, dict) and model_key in thr_json:\n",
-    "        v = thr_json.get(model_key)\n",
-    "        if isinstance(v, dict):\n",
-    "            # recursive extraction\n",
-    "            return _extract_threshold(v, None, default)\n",
-    "        if isinstance(v, (int, float)):\n",
-    "            return float(v)\n",
-    "    # Flat patterns\n",
-    "    for k in [\"threshold\", \"positive_class_threshold\"]:\n",
-    "        if k in thr_json and isinstance(thr_json[k], (int, float)):\n",
-    "            return float(thr_json[k])\n",
-    "    # thresholds by class name/index?\n",
-    "    if \"thresholds\" in thr_json and isinstance(thr_json[\"thresholds\"], dict):\n",
-    "        # prefer class \"1\", else first numeric value\n",
-    "        d = thr_json[\"thresholds\"]\n",
-    "        if \"1\" in d and isinstance(d[\"1\"], (int, float)):\n",
-    "            return float(d[\"1\"])\n",
-    "        # fallback to any float\n",
-    "        for v in d.values():\n",
-    "            if isinstance(v, (int, float)):\n",
-    "                return float(v)\n",
-    "    # last resort\n",
-    "    return default\n",
-    "\n",
-    "def _get_pos_index(model, pos_label: Optional[Any]) -> int:\n",
-    "    \"\"\"\n",
-    "    Determine which column of predict_proba is the positive class.\n",
-    "    If pos_label is None, will try to use label 1 if present, else the max label.\n",
-    "    \"\"\"\n",
-    "    if hasattr(model, \"classes_\"):\n",
-    "        classes = list(model.classes_)\n",
-    "        if pos_label is not None and pos_label in classes:\n",
-    "            return classes.index(pos_label)\n",
-    "        if 1 in classes:\n",
-    "            return classes.index(1)\n",
-    "        # Else default to the 'largest' class label\n",
-    "        return classes.index(max(classes))\n",
-    "    # If no classes_ attribute, assume last column is positive\n",
-    "    return -1\n",
-    "\n",
-    "def _align_features(df: pd.DataFrame, model) -> Tuple[pd.DataFrame, List[str], List[str]]:\n",
-    "    \"\"\"\n",
-    "    Reorder columns to match model.feature_names_in_ if available.\n",
-    "    Add missing columns as zeros. Return (aligned_df, missing, extra).\n",
-    "    \"\"\"\n",
-    "    missing, extra = [], []\n",
-    "    if hasattr(model, \"feature_names_in_\"):\n",
-    "        needed = list(model.feature_names_in_)\n",
-    "        cols = list(df.columns)\n",
-    "        missing = [c for c in needed if c not in cols]\n",
-    "        extra = [c for c in cols if c not in needed]\n",
-    "        # Build aligned df\n",
-    "        df_aligned = df.copy()\n",
-    "        for m in missing:\n",
-    "            df_aligned[m] = 0.0\n",
-    "        df_aligned = df_aligned[needed]  # reorder & drop extras\n",
-    "        return df_aligned, missing, extra\n",
-    "    return df, missing, []  # keep as-is if unknown\n",
-    "\n",
-    "def _predict_proba_safe(model, X: pd.DataFrame) -> np.ndarray:\n",
-    "    \"\"\"\n",
-    "    Try predict_proba; if not available, try decision_function and map via sigmoid.\n",
-    "    \"\"\"\n",
-    "    if hasattr(model, \"predict_proba\"):\n",
-    "        proba = model.predict_proba(X)\n",
-    "        # ensure 2D\n",
-    "        if proba.ndim == 1:\n",
-    "            proba = np.column_stack([1 - proba, proba])\n",
-    "        return proba\n",
-    "    if hasattr(model, \"decision_function\"):\n",
-    "        scores = model.decision_function(X)\n",
-    "        # scores can be (n,), convert to proba via sigmoid\n",
-    "        if scores.ndim == 1:\n",
-    "            probs_pos = 1 / (1 + np.exp(-scores))\n",
-    "            return np.column_stack([1 - probs_pos, probs_pos])\n",
-    "        # multiclass not supported here\n",
-    "    raise RuntimeError(\"Model does not support probability outputs (predict_proba/decision_function).\")\n",
-    "\n",
-    "# ---------------------------\n",
-    "# UI\n",
-    "# ---------------------------\n",
-    "\n",
-    "st.set_page_config(page_title=\"Batch Scoring with Thresholds\", page_icon=\"🧮\", layout=\"wide\")\n",
-    "\n",
-    "st.title(\"🧮 Batch Scoring App (with Thresholds)\")\n",
-    "st.caption(\"Upload a trained model, an optional threshold JSON, and a CSV/Parquet to score.\")\n",
-    "\n",
-    "with st.sidebar:\n",
-    "    st.header(\"1) Load Model(s)\")\n",
-    "    model_files = st.file_uploader(\"Upload model file(s) (.joblib / .pkl)\", type=[\"joblib\", \"pkl\"], accept_multiple_files=True)\n",
-    "    thr_files = st.file_uploader(\"Upload threshold JSON file(s) (optional)\", type=[\"json\"], accept_multiple_files=True)\n",
-    "    st.divider()\n",
-    "    st.header(\"2) Positive Class & Defaults\")\n",
-    "    pos_label_input = st.text_input(\"Positive class label (blank → auto)\", value=\"\")\n",
-    "    default_thr = st.number_input(\"Default threshold (if JSON missing)\", min_value=0.0, max_value=1.0, value=0.5, step=0.01)\n",
-    "    st.divider()\n",
-    "    st.header(\"3) Data Input\")\n",
-    "    data_file = st.file_uploader(\"Upload data (CSV/Parquet)\", type=[\"csv\", \"parquet\"])\n",
-    "    pasted = st.text_area(\"...or paste CSV text here\")\n",
-    "\n",
-    "    st.divider()\n",
-    "    st.header(\"Run\")\n",
-    "    run_btn = st.button(\"🔮 Predict\")\n",
-    "\n",
-    "# ---------------------------\n",
-    "# Load models & thresholds\n",
-    "# ---------------------------\n",
-    "\n",
-    "loaded_models = {}\n",
-    "if model_files:\n",
-    "    for mf in model_files:\n",
-    "        try:\n",
-    "            model = _load_model(mf)\n",
-    "            loaded_models[mf.name] = model\n",
-    "        except Exception as e:\n",
-    "            st.error(f\"Failed to load model {mf.name}: {e}\")\n",
-    "\n",
-    "thr_maps = {}\n",
-    "if thr_files:\n",
-    "    for tf in thr_files:\n",
-    "        try:\n",
-    "            thr_maps[tf.name] = _load_json_threshold(tf)\n",
-    "        except Exception as e:\n",
-    "            st.error(f\"Failed to read threshold JSON {tf.name}: {e}\")\n",
-    "\n",
-    "# ---------------------------\n",
-    "# Data input\n",
-    "# ---------------------------\n",
-    "\n",
-    "def _read_dataframe() -> Optional[pd.DataFrame]:\n",
-    "    if data_file is not None:\n",
-    "        try:\n",
-    "            if data_file.name.lower().endswith(\".csv\"):\n",
-    "                return pd.read_csv(data_file)\n",
-    "            return pd.read_parquet(data_file)\n",
-    "        except Exception as e:\n",
-    "            st.error(f\"Could not read {data_file.name}: {e}\")\n",
-    "            return None\n",
-    "    if pasted.strip():\n",
-    "        try:\n",
-    "            return pd.read_csv(io.StringIO(pasted))\n",
-    "        except Exception as e:\n",
-    "            st.error(f\"Could not parse pasted CSV: {e}\")\n",
-    "            return None\n",
-    "    return None\n",
-    "\n",
-    "df = _read_dataframe()\n",
-    "\n",
-    "st.subheader(\"Input Data Preview\")\n",
-    "if df is not None and not df.empty:\n",
-    "    st.dataframe(df.head(20), use_container_width=True)\n",
-    "    id_col = st.selectbox(\"Optional ID column to carry through\", options=[\"(none)\"] + list(df.columns), index=0)\n",
-    "    # Choose features: by default, all non-target columns\n",
-    "    default_feats = [c for c in df.columns if c.lower() not in {\"class\", \"target\", \"label\"}]\n",
-    "    feat_cols = st.multiselect(\"Feature columns (leave as default if unsure)\", options=list(df.columns), default=default_feats)\n",
-    "else:\n",
-    "    st.info(\"Upload a CSV/Parquet or paste CSV to begin.\")\n",
-    "    id_col = \"(none)\"\n",
-    "    feat_cols = []\n",
-    "\n",
-    "# ---------------------------\n",
-    "# Main run\n",
-    "# ---------------------------\n",
-    "\n",
-    "def _choose_threshold_for_model(model_name: str) -> float:\n",
-    "    # Try to find a matching JSON by name heuristic; else use last uploaded; else default\n",
-    "    model_key = Path(model_name).stem\n",
-    "    # exact match search\n",
-    "    for thr_name, thr_json in thr_maps.items():\n",
-    "        thr = _extract_threshold(thr_json, model_key=model_key, default=default_thr)\n",
-    "        if thr != default_thr:\n",
-    "            return float(thr)\n",
-    "    # if we have any JSONs, take the first’s generic value\n",
-    "    if thr_maps:\n",
-    "        any_thr = list(thr_maps.values())[0]\n",
-    "        return float(_extract_threshold(any_thr, model_key=None, default=default_thr))\n",
-    "    return float(default_thr)\n",
-    "\n",
-    "def _safe_to_float(x: str) -> Optional[float]:\n",
-    "    try:\n",
-    "        return float(x)\n",
-    "    except Exception:\n",
-    "        return None\n",
-    "\n",
-    "if run_btn:\n",
-    "    if not loaded_models:\n",
-    "        st.warning(\"Please upload at least one model.\")\n",
-    "    elif df is None or df.empty:\n",
-    "        st.warning(\"Please provide input data.\")\n",
-    "    elif not feat_cols:\n",
-    "        st.warning(\"Please select feature columns.\")\n",
-    "    else:\n",
-    "        pos_label = None\n",
-    "        # allow numeric or keep original\n",
-    "        if len(st.session_state.get(\"pos_label_cache\",\"\")) == 0 and len(pos_label_input.strip())==0:\n",
-    "            pass\n",
-    "        if pos_label_input.strip():\n",
-    "            # try numeric cast\n",
-    "            maybe = _safe_to_float(pos_label_input.strip())\n",
-    "            pos_label = maybe if maybe is not None else pos_label_input.strip()\n",
-    "\n",
-    "        results_tabs = st.tabs([f\"Model: {name}\" for name in loaded_models.keys()])\n",
-    "        for (name, model), tab in zip(loaded_models.items(), results_tabs):\n",
-    "            with tab:\n",
-    "                st.markdown(f\"### {name}\")\n",
-    "                # Prepare features\n",
-    "                X = df[feat_cols].copy()\n",
-    "                X_aligned, missing, extra = _align_features(X, model)\n",
-    "                if missing:\n",
-    "                    st.warning(f\"{len(missing)} missing feature(s) were added as 0: {missing[:8]}{' ...' if len(missing)>8 else ''}\")\n",
-    "                if extra and hasattr(model, \"feature_names_in_\"):\n",
-    "                    st.info(f\"{len(extra)} extra column(s) were dropped: {extra[:8]}{' ...' if len(extra)>8 else ''}\")\n",
-    "\n",
-    "                # Predict\n",
-    "                try:\n",
-    "                    proba = _predict_proba_safe(model, X_aligned)\n",
-    "                except Exception as e:\n",
-    "                    st.error(f\"Prediction failed: {e}\")\n",
-    "                    continue\n",
-    "\n",
-    "                pos_idx = _get_pos_index(model, pos_label)\n",
-    "                p = proba[:, pos_idx]\n",
-    "\n",
-    "                # Thresholds\n",
-    "                auto_thr = _choose_threshold_for_model(name)\n",
-    "                thr = st.number_input(f\"Threshold for {name}\", min_value=0.0, max_value=1.0, value=float(auto_thr), step=0.01, key=f\"thr_{name}\")\n",
-    "\n",
-    "                pred = (p >= thr).astype(int)\n",
-    "\n",
-    "                # Build output\n",
-    "                out = pd.DataFrame(index=df.index)\n",
-    "                if id_col and id_col != \"(none)\" and id_col in df.columns:\n",
-    "                    out[id_col] = df[id_col]\n",
-    "                out[\"score\"] = p\n",
-    "                out[\"pred\"] = pred\n",
-    "\n",
-    "                st.write(\"Preview of scored output:\")\n",
-    "                st.dataframe(out.head(20), use_container_width=True)\n",
-    "\n",
-    "                # Download\n",
-    "                csv = out.to_csv(index=False).encode(\"utf-8\")\n",
-    "                st.download_button(\"💾 Download predictions (CSV)\", data=csv, file_name=f\"predictions_{Path(name).stem}.csv\", mime=\"text/csv\")\n",
-    "\n",
-    "                # Basic distribution quicklook\n",
-    "                st.write(\"Score distribution (positive-probability):\")\n",
-    "                # Using built-in Streamlit chart (no custom colours)\n",
-    "                st.bar_chart(pd.DataFrame({\"score\": p}).value_counts(bins=20, sort=False).reset_index().rename(columns={\"index\": \"bin\", 0:\"count\"}).set_index(\"bin\")[\"count\"])\n",
-    "\n",
-    "# ---------------------------\n",
-    "# Footer\n",
-    "# ---------------------------\n",
-    "st.caption(\"Tip: If your model exposes `feature_names_in_`, the app will auto-align and fill missing features with 0.\")\n"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3 (ipykernel)",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.10.0"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+# app.py
+import io
+import json
+import pickle
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+
+# -------------------------
+# Small helpers
+# -------------------------
+def load_model(uploaded_file) -> Any:
+    """Load a scikit-learn / XGBoost / LightGBM model saved via joblib or pickle."""
+    data = uploaded_file.read()
+    # Try joblib first (common for sklearn)
+    try:
+        import joblib
+        return joblib.load(io.BytesIO(data))
+    except Exception:
+        pass
+    # Fallback to pickle
+    return pickle.loads(data)
+
+def read_dataframe(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+    elif name.endswith(".parquet") or name.endswith(".pq"):
+        return pd.read_parquet(uploaded_file)
+    else:
+        # Last-resort CSV
+        return pd.read_csv(uploaded_file)
+
+def predict_proba_safe(model, X: pd.DataFrame) -> Optional[np.ndarray]:
+    """Return positive-class probabilities if possible, else None."""
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)
+        # Binary: take column for positive class (try class 1 if present, else last col)
+        if proba.ndim == 2:
+            if hasattr(model, "classes_") and 1 in getattr(model, "classes_", []):
+                pos_idx = list(model.classes_).index(1)
+            else:
+                pos_idx = -1
+            return proba[:, pos_idx]
+    if hasattr(model, "decision_function"):
+        s = model.decision_function(X)
+        # Sigmoid map for binary scores
+        if s.ndim == 1:
+            return 1 / (1 + np.exp(-s))
+    return None
+
+
+# -------------------------
+# UI
+# -------------------------
+st.set_page_config(page_title="Simple Batch Predictor", page_icon="🧪", layout="centered")
+st.title("🧪 Simple Batch Predictor")
+st.caption("Upload a trained model and a DataFrame with feature columns. Get predictions and probabilities (if available).")
+
+with st.sidebar:
+    st.header("1) Upload model")
+    model_file = st.file_uploader("Model file (.joblib / .pkl)", type=["joblib", "pkl"])
+
+    st.header("2) Upload data")
+    data_file = st.file_uploader("Data file (.csv / .parquet)", type=["csv", "parquet", "pq"])
+
+    st.header("Options")
+    default_threshold = st.number_input("Decision threshold (binary)", 0.0, 1.0, 0.5, 0.01)
+    run = st.button("Predict")
+
+# State
+model = None
+df = None
+
+# Load model
+if model_file is not None:
+    try:
+        model = load_model(model_file)
+        st.success(f"Loaded model: {model_file.name}")
+    except Exception as e:
+        st.error(f"Could not load model: {e}")
+
+# Load data
+if data_file is not None:
+    try:
+        df = read_dataframe(data_file)
+        st.success(f"Loaded data: {data_file.name}  •  {len(df):,} rows, {df.shape[1]} cols")
+        st.write("Data preview:")
+        st.dataframe(df.head(15), use_container_width=True)
+    except Exception as e:
+        st.error(f"Could not read data: {e}")
+
+# Feature selection
+if df is not None:
+    st.subheader("Select feature columns")
+    default_feats = [c for c in df.columns if c.lower() not in {"class", "target", "label"}]
+    feat_cols = st.multiselect(
+        "Features used by the model",
+        options=list(df.columns),
+        default=default_feats if default_feats else list(df.columns),
+    )
+    id_col = st.selectbox("Optional ID column to keep", options=["(none)"] + list(df.columns), index=0)
+else:
+    feat_cols, id_col = [], "(none)"
+
+# Run prediction
+if run:
+    if model is None:
+        st.warning("Upload a model first.")
+    elif df is None:
+        st.warning("Upload a data file first.")
+    elif not feat_cols:
+        st.warning("Select at least one feature column.")
+    else:
+        X = df[feat_cols].copy()
+
+        # Try to align to model.feature_names_in_, if it exists
+        if hasattr(model, "feature_names_in_"):
+            needed = list(model.feature_names_in_)
+            missing = [c for c in needed if c not in X.columns]
+            extra = [c for c in X.columns if c not in needed]
+            # Add missing as 0.0
+            for m in missing:
+                X[m] = 0.0
+            # Reorder to match model
+            X = X[needed]
+            if missing:
+                st.info(f"Added {len(missing)} missing feature(s) as 0: {missing[:8]}{' ...' if len(missing)>8 else ''}")
+            if extra:
+                st.info(f"Ignored {len(extra)} extra column(s) not used by the model: {extra[:8]}{' ...' if len(extra)>8 else ''}")
+
+        # Predictions
+        y_prob = predict_proba_safe(model, X)
+        # If probability not available, fall back to label prediction
+        if y_prob is None:
+            if hasattr(model, "predict"):
+                y_pred = model.predict(X)
+                out = pd.DataFrame(index=df.index)
+                if id_col != "(none)" and id_col in df.columns:
+                    out[id_col] = df[id_col]
+                out["prediction"] = y_pred
+                st.subheader("Results")
+                st.dataframe(out.head(30), use_container_width=True)
+                st.download_button(
+                    "💾 Download results (CSV)",
+                    out.to_csv(index=False).encode("utf-8"),
+                    file_name=f"predictions_{Path(model_file.name).stem}.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.error("Model has neither predict_proba/decision_function nor predict.")
+        else:
+            # Binary probabilities available
+            y_pred = (y_prob >= default_threshold).astype(int)
+            out = pd.DataFrame(index=df.index)
+            if id_col != "(none)" and id_col in df.columns:
+                out[id_col] = df[id_col]
+            out["probability"] = y_prob
+            out["prediction"] = y_pred
+
+            st.subheader("Results")
+            st.dataframe(out.head(30), use_container_width=True)
+
+            # Quick distribution
+            st.caption("Probability distribution (binned):")
+            hist = pd.Series(y_prob).value_counts(bins=20, sort=False)
+            st.bar_chart(hist)
+
+            st.download_button(
+                "💾 Download results (CSV)",
+                out.to_csv(index=False).encode("utf-8"),
+                file_name=f"predictions_{Path(model_file.name).stem}.csv",
+                mime="text/csv",
+            )
+
+st.caption("Tip: If your model exposes `feature_names_in_`, features will be auto-aligned and missing ones filled with 0.")
