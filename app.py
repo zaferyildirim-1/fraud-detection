@@ -16,6 +16,8 @@ import streamlit as st
 HERE = Path(__file__).parent
 MODEL_PATH = HERE / "xgb_mid_model.joblib"
 THRESHOLD_PATH = HERE / "xgb_mid_threshold.json"   # optional
+IMG_A = HERE / "a.png"
+IMG_B = HERE / "b.png"
 
 
 # -----------------------------
@@ -23,9 +25,7 @@ THRESHOLD_PATH = HERE / "xgb_mid_threshold.json"   # optional
 # -----------------------------
 @st.cache_resource(show_spinner=False)
 def load_model(path: Path) -> Any:
-    """Load joblib/pickle model from disk."""
     data = path.read_bytes()
-    # Try joblib first, fallback to pickle
     try:
         import joblib
         return joblib.load(io.BytesIO(data))
@@ -34,7 +34,6 @@ def load_model(path: Path) -> Any:
 
 @st.cache_data(show_spinner=False)
 def load_threshold(path: Path) -> Optional[float]:
-    """Read a numeric threshold from JSON (several shapes supported)."""
     if not path.exists():
         return None
     try:
@@ -48,7 +47,6 @@ def load_threshold(path: Path) -> Optional[float]:
             if isinstance(thrs, dict):
                 if isinstance(thrs.get("1"), (int, float)):
                     return float(thrs["1"])
-                # fallback to first numeric
                 for v in thrs.values():
                     if isinstance(v, (int, float)):
                         return float(v)
@@ -60,17 +58,14 @@ def read_csv(uploaded_file) -> pd.DataFrame:
     return pd.read_csv(uploaded_file)
 
 def predict_proba_safe(model: Any, X: pd.DataFrame) -> Optional[np.ndarray]:
-    """Return positive-class probabilities if possible, else None."""
-    # predict_proba preferred
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(X)
         if proba.ndim == 2:
             if hasattr(model, "classes_") and 1 in getattr(model, "classes_", []):
                 pos_idx = list(model.classes_).index(1)
             else:
-                pos_idx = -1  # last column
+                pos_idx = -1
             return proba[:, pos_idx]
-    # decision_function → sigmoid
     if hasattr(model, "decision_function"):
         s = model.decision_function(X)
         if np.ndim(s) == 1:
@@ -78,7 +73,6 @@ def predict_proba_safe(model: Any, X: pd.DataFrame) -> Optional[np.ndarray]:
     return None
 
 def align_features(df: pd.DataFrame, model: Any) -> (pd.DataFrame, List[str], List[str]):
-    """Align DF columns to model.feature_names_in_ if present; add missing as 0."""
     missing, extra = [], []
     if hasattr(model, "feature_names_in_"):
         needed = list(model.feature_names_in_)
@@ -88,7 +82,7 @@ def align_features(df: pd.DataFrame, model: Any) -> (pd.DataFrame, List[str], Li
         df_aligned = df.copy()
         for m in missing:
             df_aligned[m] = 0.0
-        df_aligned = df_aligned[needed]  # reorder & drop extras
+        df_aligned = df_aligned[needed]
         return df_aligned, missing, extra
     return df, missing, extra
 
@@ -96,11 +90,21 @@ def align_features(df: pd.DataFrame, model: Any) -> (pd.DataFrame, List[str], Li
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="Fraud – Batch Predictor", page_icon="🧮", layout="centered")
+st.set_page_config(page_title="Fraud – Batch Predictor", page_icon="🧮", layout="wide")
+
+# Top images
+col1, col2 = st.columns(2)
+with col1:
+    if IMG_A.exists():
+        st.image(str(IMG_A), caption="Model Scores", use_container_width=True)
+with col2:
+    if IMG_B.exists():
+        st.image(str(IMG_B), caption="PR Curve", use_container_width=True)
+
 st.title("🧮 Simple Batch Predictor (repo model)")
 st.caption("Uses `xgb_mid_model.joblib` and optional `xgb_mid_threshold.json` from this repository. Upload a CSV of features.")
 
-# Load model & threshold at app start
+# Load model
 if not MODEL_PATH.exists():
     st.error(f"Model file not found at: {MODEL_PATH.name}")
     st.stop()
@@ -165,7 +169,6 @@ if run:
         if extra and hasattr(model, 'feature_names_in_'):
             st.info(f"Ignored {len(extra)} extra column(s): {extra[:10]}{' ...' if len(extra)>10 else ''}")
 
-        # Probabilities if possible
         y_prob = predict_proba_safe(model, X)
         if y_prob is None:
             if hasattr(model, "predict"):
@@ -176,16 +179,14 @@ if run:
                 out["prediction"] = y_pred
                 st.subheader("Results")
                 st.dataframe(out.head(30), use_container_width=True)
-                st.download_button(
-                    "💾 Download results (CSV)",
-                    out.to_csv(index=False).encode("utf-8"),
-                    file_name="predictions.csv",
-                    mime="text/csv",
-                )
+                st.download_button("💾 Download results (CSV)",
+                                   out.to_csv(index=False).encode("utf-8"),
+                                   file_name="predictions.csv",
+                                   mime="text/csv")
             else:
                 st.error("Model has neither predict_proba/decision_function nor predict.")
         else:
-            use_thr = float(fallback_thr)  # acts as override even if JSON exists
+            use_thr = float(fallback_thr)
             y_pred = (y_prob >= use_thr).astype(int)
             out = pd.DataFrame(index=df.index)
             if id_col != "(none)" and id_col in df.columns:
@@ -200,11 +201,8 @@ if run:
             hist = pd.Series(y_prob).value_counts(bins=20, sort=False)
             st.bar_chart(hist)
 
-            st.download_button(
-                "💾 Download results (CSV)",
-                out.to_csv(index=False).encode("utf-8"),
-                file_name="predictions.csv",
-                mime="text/csv",
-            )
+            st.download_button("💾 Download results (CSV)",
+                               out.to_csv(index=False).encode("utf-8"),
+                               file_name="predictions.csv",
+                               mime="text/csv")
 
-st.caption("Tip: `feature_names_in_` found → columns auto-aligned; missing features filled with 0.")
